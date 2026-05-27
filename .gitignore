@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data and generated indexes
+api_text_cache/
+metadata/
+pdfs/
+texts/
+vector_db/
+v2/
+v2_smoke/
+v2_source/
+reader_data/
+fts_index.sqlite
+*.sqlite
+*.sqlite3
+search_eval*.json
+
+# Local secrets
+.env
+*.env

@@ -1,0 +1,21 @@
+[Unit]
+Description=ResearchDB FastAPI Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=server118
+Group=server118
+WorkingDirectory=/data/D/zzn/evo
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/data/D/zzn/evo
+EnvironmentFile=/etc/researchdb.env
+ExecStart=/home/server118/anaconda3/envs/research_kb/bin/python -m uvicorn research_kb.backend.server:app --host 0.0.0.0 --port 18000
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
