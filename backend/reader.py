@@ -46,6 +46,7 @@ from pydantic import BaseModel
 CVF_BASE_URL = "https://openaccess.thecvf.com"
 SERVER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVER_DIR.parent
+REPO_ROOT = PROJECT_ROOT.parent
 DATA_DIR = Path(
     os.environ.get(
         "READER_DATA_DIR",
@@ -56,6 +57,12 @@ PDF_DIR = DATA_DIR / "pdfs"
 PAGE_IMAGE_DIR = DATA_DIR / "page_images"
 FIGURE_DIR = DATA_DIR / "figures"
 DB_PATH = DATA_DIR / "papers.db"
+RESEARCH_DOWNLOAD_MAP_PATH = Path(
+    os.environ.get(
+        "RESEARCH_KB_DOWNLOAD_MAP_PATH",
+        PROJECT_ROOT / "v2" / "metadata" / "download_map.json",
+    )
+).expanduser()
 
 DEFAULT_LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
@@ -485,6 +492,10 @@ def ensure_pdf_downloaded(paper_id: str) -> Path:
     if pdf_path.exists() and pdf_path.stat().st_size > 1000:
         return pdf_path
 
+    research_pdf_path = resolve_research_pdf_path(paper_id)
+    if research_pdf_path and research_pdf_path.exists() and research_pdf_path.stat().st_size > 1000:
+        return research_pdf_path
+
     try:
         log.info(f"下载 PDF: {paper['pdf_url']}")
         resp = requests.get(
@@ -502,6 +513,30 @@ def ensure_pdf_downloaded(paper_id: str) -> Path:
         raise HTTPException(502, f"PDF download failed: {e}")
 
     return pdf_path
+
+
+def resolve_research_pdf_path(paper_id: str) -> Optional[Path]:
+    if not RESEARCH_DOWNLOAD_MAP_PATH.exists():
+        return None
+    try:
+        with open(RESEARCH_DOWNLOAD_MAP_PATH, "r", encoding="utf-8") as f:
+            download_map = json.load(f)
+    except Exception as exc:
+        log.warning(f"ResearchDB download_map 读取失败: {exc}")
+        return None
+
+    relative = download_map.get(paper_id)
+    if not relative:
+        return None
+
+    candidate = Path(relative)
+    if not candidate.is_absolute():
+        candidate = (REPO_ROOT / candidate).resolve()
+    if candidate.exists():
+        return candidate
+
+    fallback = (PROJECT_ROOT / "pdfs" / Path(relative).name).resolve()
+    return fallback if fallback.exists() else None
 
 
 def render_pdf_page_images(paper_id: str, max_pages: int = 6) -> list[Path]:
@@ -1546,15 +1581,24 @@ SUPPORTED_CONFERENCES = [
 
 @app.get("/api/conferences")
 def list_conferences():
-    """列出支持的会议。"""
+    """List conferences from the unified reader/research paper table."""
     with get_db() as db:
-        synced = {r["conference"]: {"last_sync": r["last_sync"], "count": r["paper_count"]}
-                  for r in db.execute("SELECT * FROM sync_log").fetchall()}
+        sync_log = {
+            r["conference"]: r["last_sync"]
+            for r in db.execute("SELECT conference, last_sync FROM sync_log").fetchall()
+        }
+        rows = db.execute("""
+            SELECT conference, COUNT(*) as paper_count
+            FROM papers
+            GROUP BY conference
+            ORDER BY paper_count DESC, conference ASC
+        """).fetchall()
     return [{
-        "id": c, "synced": c in synced,
-        "paper_count": synced.get(c, {}).get("count", 0),
-        "last_sync": synced.get(c, {}).get("last_sync"),
-    } for c in SUPPORTED_CONFERENCES]
+        "id": row["conference"],
+        "synced": True,
+        "paper_count": row["paper_count"],
+        "last_sync": sync_log.get(row["conference"]),
+    } for row in rows]
 
 
 @app.post("/api/conferences/{conference}/sync")
