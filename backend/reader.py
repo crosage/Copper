@@ -16,7 +16,6 @@ Paper Reader — FastAPI 后端
 
 import os
 import re
-import time
 import json
 import sqlite3
 import hashlib
@@ -26,7 +25,7 @@ import shutil
 import subprocess
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from contextlib import contextmanager
 from urllib.parse import urljoin
@@ -34,7 +33,7 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -71,7 +70,6 @@ DEFAULT_LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "420"))
 AUTO_TRANSLATE_ON_START = os.environ.get("AUTO_TRANSLATE_ON_START", "0").lower() not in ("0", "false", "no")
 AUTO_TRANSLATE_LIMIT = int(os.environ.get("AUTO_TRANSLATE_LIMIT", "0"))
 PDF_IMAGE_DPI = int(os.environ.get("PDF_IMAGE_DPI", "144"))
-FIGURE_IMAGE_DPI = int(os.environ.get("FIGURE_IMAGE_DPI", "180"))
 MAX_EXTRACTED_FIGURES = int(os.environ.get("MAX_EXTRACTED_FIGURES", "16"))
 PDFFIGURES2_CMD = os.environ.get("PDFFIGURES2_CMD", "").strip()
 PDFFIGURES2_JAR = os.environ.get("PDFFIGURES2_JAR", "").strip()
@@ -576,7 +574,6 @@ def render_pdf_page_images(paper_id: str, max_pages: int = 6) -> list[Path]:
         raise HTTPException(500, f"PDF page rendering failed: {e}")
 
 
-FIGURE_CAPTION_RE = re.compile(r"(?i)\b(?:fig(?:ure)?\.?)\s*([0-9]+)\b")
 INSERTED_FIGURE_MARKDOWN_RE = re.compile(r"\n{0,2}!\[Figure [^\]]+\]\(/api/papers/[^)]+/figures/[^)]+\)\n?", re.IGNORECASE)
 
 
@@ -1942,33 +1939,6 @@ def get_sections(paper_id: str):
     """获取提取的 sections（不触发 LLM）。"""
     sections = download_and_extract(paper_id)
     return {"paper_id": paper_id, "sections": sections}
-
-
-@app.get("/api/papers/{paper_id}/page-images")
-def get_page_images(paper_id: str, limit: int = 8):
-    """Render and list leading PDF page images for reading."""
-    limit = max(1, min(limit, 20))
-    paths = render_pdf_page_images(paper_id, max_pages=limit)
-    return {
-        "paper_id": paper_id,
-        "images": [
-            {
-                "page": i + 1,
-                "url": f"/api/papers/{paper_id}/page-images/{i + 1}",
-            }
-            for i, _ in enumerate(paths)
-        ],
-    }
-
-
-@app.get("/api/papers/{paper_id}/page-images/{page_no}")
-def get_page_image_file(paper_id: str, page_no: int):
-    if page_no < 1:
-        raise HTTPException(404, "page image not found")
-    paths = render_pdf_page_images(paper_id, max_pages=page_no)
-    if page_no > len(paths):
-        raise HTTPException(404, "page image not found")
-    return FileResponse(paths[page_no - 1], media_type="image/jpeg")
 
 
 @app.get("/api/papers/{paper_id}/figures")
