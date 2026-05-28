@@ -584,6 +584,30 @@ def _figure_cache_is_current(figures: list[dict]) -> bool:
     return all(fig.get("source") in {"pdffigures2", "page_snapshot"} and fig.get("file") for fig in figures)
 
 
+def _natural_sort_value(value: object) -> tuple:
+    text = str(value or "").strip().lower()
+    parts = re.split(r"(\d+)", text)
+    key = []
+    for part in parts:
+        if not part:
+            continue
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    return tuple(key) if key else ((1, text),)
+
+
+def _figure_sort_key(fig: dict) -> tuple:
+    number = str(fig.get("number") or "").strip()
+    if number.startswith("page-"):
+        return (1, _natural_sort_value(number), int(fig.get("page") or 0))
+    if re.search(r"\d", number):
+        return (0, _natural_sort_value(number), int(fig.get("page") or 0))
+    return (0, ((1, number.lower()),), int(fig.get("page") or 0))
+
+
+def _sort_figures(figures: list[dict]) -> list[dict]:
+    return sorted(figures, key=_figure_sort_key)
+
+
 def strip_inserted_figure_markdown(text: str) -> str:
     if INSERT_FIGURES_IN_TRANSLATION:
         return text
@@ -668,8 +692,8 @@ def _load_pdffigures2_figures(paper_id: str, pdf_path: Path, out_dir: Path, max_
         if not image_path or not image_path.exists():
             continue
 
-        number = str(item.get("name") or idx)
-        match = re.search(r"\d+", number)
+        number = str(item.get("name") or idx).strip()
+        match = re.search(r"\d+(?:[A-Za-z])?", number)
         number = match.group(0) if match else str(idx)
         caption = re.sub(r"\s+", " ", item.get("caption", "") or "")[:800]
         figures.append({
@@ -683,7 +707,7 @@ def _load_pdffigures2_figures(paper_id: str, pdf_path: Path, out_dir: Path, max_
         })
         if len(figures) >= max_figures:
             break
-    return figures
+    return _sort_figures(figures)
 
 
 def _fallback_page_figures(paper_id: str, max_figures: int) -> list[dict]:
@@ -712,7 +736,7 @@ def extract_pdf_figures(paper_id: str, max_figures: int = MAX_EXTRACTED_FIGURES,
             cached = json.loads(meta_path.read_text(encoding="utf-8"))
             has_only_snapshots = cached and all(fig.get("source") == "page_snapshot" for fig in cached)
             if _figure_cache_is_current(cached) and not (pdffigures2_available() and has_only_snapshots):
-                return cached[:max_figures]
+                return _sort_figures(cached)[:max_figures]
         except Exception:
             pass
 
@@ -723,7 +747,7 @@ def extract_pdf_figures(paper_id: str, max_figures: int = MAX_EXTRACTED_FIGURES,
         figures = _fallback_page_figures(paper_id, max_figures)
 
     meta_path.write_text(json.dumps(figures, ensure_ascii=False, indent=2), encoding="utf-8")
-    return figures[:max_figures]
+    return _sort_figures(figures)[:max_figures]
 
 
 def build_figure_reference_map(paper_id: str, translation: str) -> list[dict]:
