@@ -70,7 +70,7 @@ DEFAULT_LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "420"))
 AUTO_TRANSLATE_ON_START = os.environ.get("AUTO_TRANSLATE_ON_START", "0").lower() not in ("0", "false", "no")
 AUTO_TRANSLATE_LIMIT = int(os.environ.get("AUTO_TRANSLATE_LIMIT", "0"))
 PDF_IMAGE_DPI = int(os.environ.get("PDF_IMAGE_DPI", "144"))
-MAX_EXTRACTED_FIGURES = int(os.environ.get("MAX_EXTRACTED_FIGURES", "16"))
+MAX_EXTRACTED_FIGURES = int(os.environ.get("MAX_EXTRACTED_FIGURES", "40"))
 PDFFIGURES2_CMD = os.environ.get("PDFFIGURES2_CMD", "").strip()
 PDFFIGURES2_JAR = os.environ.get("PDFFIGURES2_JAR", "").strip()
 INSERT_FIGURES_IN_TRANSLATION = os.environ.get("INSERT_FIGURES_IN_TRANSLATION", "0").lower() not in ("0", "false", "no")
@@ -581,6 +581,15 @@ def _figure_cache_is_current(figures: list[dict]) -> bool:
     return all(fig.get("source") in {"pdffigures2", "page_snapshot"} and fig.get("file") for fig in figures)
 
 
+def _read_cached_figures(meta_path: Path) -> tuple[list[dict], int]:
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        figures = raw.get("figures", [])
+        requested_limit = int(raw.get("requested_limit") or len(figures))
+        return figures if isinstance(figures, list) else [], requested_limit
+    return raw if isinstance(raw, list) else [], len(raw) if isinstance(raw, list) else 0
+
+
 def _natural_sort_value(value: object) -> tuple:
     text = str(value or "").strip().lower()
     parts = re.split(r"(\d+)", text)
@@ -730,9 +739,14 @@ def extract_pdf_figures(paper_id: str, max_figures: int = MAX_EXTRACTED_FIGURES,
     meta_path = out_dir / "figures.json"
     if meta_path.exists() and not refresh:
         try:
-            cached = json.loads(meta_path.read_text(encoding="utf-8"))
+            cached, cached_limit = _read_cached_figures(meta_path)
             has_only_snapshots = cached and all(fig.get("source") == "page_snapshot" for fig in cached)
-            if _figure_cache_is_current(cached) and not (pdffigures2_available() and has_only_snapshots):
+            can_satisfy_limit = cached_limit >= max_figures or len(cached) < cached_limit
+            if (
+                _figure_cache_is_current(cached)
+                and can_satisfy_limit
+                and not (pdffigures2_available() and has_only_snapshots)
+            ):
                 return _sort_figures(cached)[:max_figures]
         except Exception:
             pass
@@ -743,7 +757,11 @@ def extract_pdf_figures(paper_id: str, max_figures: int = MAX_EXTRACTED_FIGURES,
     if not figures:
         figures = _fallback_page_figures(paper_id, max_figures)
 
-    meta_path.write_text(json.dumps(figures, ensure_ascii=False, indent=2), encoding="utf-8")
+    meta_path.write_text(json.dumps({
+        "version": 2,
+        "requested_limit": max_figures,
+        "figures": figures,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     return _sort_figures(figures)[:max_figures]
 
 
@@ -1944,7 +1962,7 @@ def get_sections(paper_id: str):
 @app.get("/api/papers/{paper_id}/figures")
 def get_figures(paper_id: str, limit: int = MAX_EXTRACTED_FIGURES):
     """Extract figures with pdffigures2 when configured, otherwise return page snapshots."""
-    limit = max(1, min(limit, 40))
+    limit = max(1, min(limit, 80))
     figures = extract_pdf_figures(paper_id, max_figures=limit)
     sources = sorted({str(fig.get("source", "unknown")) for fig in figures})
     extraction_mode = "pdffigures2" if any(src == "pdffigures2" for src in sources) else "page_snapshot"
