@@ -55,6 +55,29 @@ COLLECTION_NAME = os.environ.get(
     "research_papers_v2" if DEFAULT_INDEX_ROOT == KB_V2_ROOT else "research_papers",
 )
 
+VENUE_ALIASES = {
+    "aaai": "AAAI",
+    "cvpr": "CVPR",
+    "iccv": "ICCV",
+    "eccv": "ECCV",
+    "wacv": "WACV",
+    "neurips": "NEURIPS",
+    "nips": "NEURIPS",
+    "iclr": "ICLR",
+    "icml": "ICML",
+}
+
+CHINESE_QUERY_EXPANSIONS = {
+    "遥感": "remote sensing",
+    "语义分割": "semantic segmentation",
+    "实例分割": "instance segmentation",
+    "图像分割": "image segmentation",
+    "变化检测": "change detection",
+    "目标检测": "object detection",
+    "多模态": "multimodal",
+    "大模型": "large language model foundation model",
+}
+
 
 def resolve_embedding_model(model_name: str) -> str:
     """优先使用本地缓存的 HF snapshot，避免服务运行时再访问网络。"""
@@ -109,6 +132,54 @@ def clean_text(text: str) -> str:
 def safe_filename(name: str, fallback: str) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_.")
     return value or fallback
+
+
+def parse_search_constraints(query: str) -> dict[str, Any]:
+    compact = re.sub(r"[\s_\-]+", "", query.lower())
+    years = sorted(set(re.findall(r"(?:19|20)\d{2}", query)))
+    venues = []
+    for alias, canonical in VENUE_ALIASES.items():
+        if alias in compact and canonical not in venues:
+            venues.append(canonical)
+    return {"venues": venues, "years": years}
+
+
+def strip_search_constraints(query: str, constraints: dict[str, Any]) -> str:
+    cleaned = query
+    for alias in VENUE_ALIASES:
+        cleaned = re.sub(rf"(?i){re.escape(alias)}[\s_-]*(?:19|20)\d{{2}}", " ", cleaned)
+        cleaned = re.sub(rf"(?i)\b{re.escape(alias)}\b", " ", cleaned)
+    for year in constraints.get("years", []):
+        cleaned = cleaned.replace(str(year), " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or query
+
+
+def expand_query_terms(query: str) -> str:
+    expansions = [value for key, value in CHINESE_QUERY_EXPANSIONS.items() if key in query]
+    if not expansions:
+        return query
+    return f"{query} {' '.join(expansions)}"
+
+
+def retrieval_query(query: str, constraints: dict[str, Any]) -> str:
+    return expand_query_terms(strip_search_constraints(query, constraints))
+
+
+def normalized_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def matches_search_constraints(item: dict[str, Any], constraints: dict[str, Any]) -> bool:
+    years = {str(year) for year in constraints.get("years", [])}
+    if years and str(item.get("year") or "") not in years:
+        return False
+    venues = constraints.get("venues", [])
+    if venues:
+        venue_text = normalized_text(item.get("venue") or item.get("source_conference") or "")
+        if not any(normalized_text(venue) in venue_text for venue in venues):
+            return False
+    return True
 
 
 class ResearchKBStore:
@@ -238,9 +309,11 @@ def get_vector_collection():
     return client.get_collection(name=COLLECTION_NAME, embedding_function=emb_fn)
 
 
-def search_vector_db(query: str, limit: int) -> list[dict[str, Any]]:
+def search_vector_db(query: str, limit: int, constraints: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     collection = get_vector_collection()
-    result = collection.query(query_texts=[query], n_results=max(limit * 3, limit))
+    constraints = constraints or {}
+    fetch_limit = max(limit * (12 if constraints.get("venues") or constraints.get("years") else 3), 80 if constraints else limit)
+    result = collection.query(query_texts=[retrieval_query(query, constraints)], n_results=fetch_limit)
 
     matches = []
     for idx in range(len(result["ids"][0])):
@@ -283,6 +356,8 @@ def search_vector_db(query: str, limit: int) -> list[dict[str, Any]]:
     seen_papers = set()
     deduped = []
     for item in matches:
+        if constraints and not matches_search_constraints(item, constraints):
+            continue
         paper_key = item.get("paper_id") or item.get("title", "")
         if paper_key and paper_key in seen_papers:
             continue
@@ -304,13 +379,31 @@ def fts_query_string(query: str) -> str:
     return " OR ".join(f'"{token}"' for token in expanded if token)
 
 
-def search_fts_db(query: str, limit: int) -> list[dict[str, Any]]:
+def fts_filter_sql(constraints: dict[str, Any]) -> tuple[str, list[Any]]:
+    conditions = []
+    params: list[Any] = []
+    years = constraints.get("years", [])
+    venues = constraints.get("venues", [])
+    if years:
+        conditions.append(f"p.year IN ({','.join('?' for _ in years)})")
+        params.extend(str(year) for year in years)
+    if venues:
+        conditions.append("(" + " OR ".join("UPPER(p.venue) LIKE ?" for _ in venues) + ")")
+        params.extend(f"%{venue.upper()}%" for venue in venues)
+    if not conditions:
+        return "", []
+    return " AND " + " AND ".join(conditions), params
+
+
+def search_fts_db(query: str, limit: int, constraints: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     if not FTS_INDEX_PATH.exists():
         raise RuntimeError(f"FTS index not found: {FTS_INDEX_PATH}")
 
-    fts_query = fts_query_string(query)
-    if not fts_query:
+    constraints = constraints or {}
+    fts_query = fts_query_string(retrieval_query(query, constraints))
+    if not fts_query and not constraints:
         return []
+    filter_sql, filter_params = fts_filter_sql(constraints)
 
     connection = sqlite3.connect(FTS_INDEX_PATH)
     connection.row_factory = sqlite3.Row
@@ -318,9 +411,9 @@ def search_fts_db(query: str, limit: int) -> list[dict[str, Any]]:
         has_chunk_fts = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_fts'"
         ).fetchone()
-        if has_chunk_fts:
+        if has_chunk_fts and fts_query:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     p.paper_id,
                     p.title,
@@ -335,15 +428,15 @@ def search_fts_db(query: str, limit: int) -> list[dict[str, Any]]:
                 FROM chunk_fts
                 JOIN chunks c ON c.chunk_id = chunk_fts.chunk_id
                 JOIN papers p ON p.paper_id = chunk_fts.paper_id
-                WHERE chunk_fts MATCH ?
+                WHERE chunk_fts MATCH ? {filter_sql}
                 ORDER BY score ASC, CAST(p.year AS INTEGER) DESC, p.citation_count DESC
                 LIMIT ?
                 """,
-                (fts_query, max(limit * 3, limit)),
+                (fts_query, *filter_params, max(limit * 6, limit)),
             ).fetchall()
-        else:
+        elif fts_query:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     p.paper_id,
                     p.title,
@@ -357,11 +450,32 @@ def search_fts_db(query: str, limit: int) -> list[dict[str, Any]]:
                     snippet(paper_fts, 5, '', '', ' ... ', 120) AS snippet
                 FROM paper_fts
                 JOIN papers p ON p.paper_id = paper_fts.paper_id
-                WHERE paper_fts MATCH ?
+                WHERE paper_fts MATCH ? {filter_sql}
                 ORDER BY score ASC, CAST(p.year AS INTEGER) DESC, p.citation_count DESC
                 LIMIT ?
                 """,
-                (fts_query, max(limit * 3, limit)),
+                (fts_query, *filter_params, max(limit * 6, limit)),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    p.paper_id,
+                    p.title,
+                    p.venue,
+                    p.year,
+                    p.citation_count,
+                    NULL AS chunk_id,
+                    '' AS section,
+                    '' AS chunk_type,
+                    0.0 AS score,
+                    p.abstract AS snippet
+                FROM papers p
+                WHERE 1=1 {filter_sql}
+                ORDER BY CAST(p.year AS INTEGER) DESC, p.citation_count DESC
+                LIMIT ?
+                """,
+                (*filter_params, max(limit * 6, limit)),
             ).fetchall()
     finally:
         connection.close()
@@ -429,6 +543,7 @@ def lexical_signal(query: str, item: dict[str, Any]) -> int:
 
 
 def search_hybrid_db(query: str, limit: int) -> list[dict[str, Any]]:
+    constraints = parse_search_constraints(query)
     candidates: dict[str, dict[str, Any]] = {}
     errors = []
 
@@ -437,7 +552,7 @@ def search_hybrid_db(query: str, limit: int) -> list[dict[str, Any]]:
         ("fts", max(limit * 4, 20), search_fts_db),
     ):
         try:
-            results = fetcher(query, fetch_limit)
+            results = fetcher(query, fetch_limit, constraints)
         except Exception as exc:
             errors.append(f"{source}: {exc}")
             continue
@@ -462,7 +577,11 @@ def search_hybrid_db(query: str, limit: int) -> list[dict[str, Any]]:
 
     items = list(candidates.values())
     for item in items:
-        item["_hybrid_score"] += 0.01 * lexical_signal(query, item)
+        if constraints and not matches_search_constraints(item, constraints):
+            item["_hybrid_score"] -= 10
+        item["_hybrid_score"] += 0.01 * lexical_signal(retrieval_query(query, constraints), item)
+        if constraints.get("venues") or constraints.get("years"):
+            item["_hybrid_score"] += 0.5
         try:
             item["_year_sort"] = int(item.get("year") or 0)
         except ValueError:
@@ -481,6 +600,7 @@ def search_hybrid_db(query: str, limit: int) -> list[dict[str, Any]]:
     for item in items:
         item.pop("_hybrid_score", None)
         item.pop("_year_sort", None)
+        item["parsed_filters"] = constraints
     return items[:limit]
 
 
@@ -630,12 +750,14 @@ def search(
     limit: int = Query(10, ge=1, le=50),
     mode: str = Query("auto", pattern="^(auto|vector|keyword|fts|hybrid)$"),
 ):
+    constraints = parse_search_constraints(query)
     if mode == "hybrid":
         try:
             items = search_hybrid_db(query, limit)
             return {
                 "query": query,
                 "mode": "hybrid",
+                "parsed_filters": constraints,
                 "count": len(items),
                 "items": items,
             }
@@ -644,10 +766,11 @@ def search(
 
     if mode == "fts":
         try:
-            items = search_fts_db(query, limit)
+            items = search_fts_db(query, limit, constraints)
             return {
                 "query": query,
                 "mode": "fts",
+                "parsed_filters": constraints,
                 "count": len(items),
                 "items": items,
             }
@@ -656,10 +779,11 @@ def search(
 
     if mode in {"auto", "vector"}:
         try:
-            items = search_vector_db(query, limit)
+            items = search_vector_db(query, limit, constraints)
             return {
                 "query": query,
                 "mode": "vector",
+                "parsed_filters": constraints,
                 "count": len(items),
                 "items": items,
             }
@@ -668,8 +792,10 @@ def search(
                 raise HTTPException(503, f"向量检索不可用: {exc}") from exc
 
     fallback = []
-    for item in store.keyword_search(query, limit):
+    for item in store.keyword_search(retrieval_query(query, constraints), limit * 4):
         payload = store.build_paper_payload(item["paper"])
+        if constraints and not matches_search_constraints(payload, constraints):
+            continue
         payload.update(
             {
                 "chunk_id": None,
@@ -678,10 +804,13 @@ def search(
             }
         )
         fallback.append(payload)
+        if len(fallback) >= limit:
+            break
 
     return {
         "query": query,
         "mode": "keyword",
+        "parsed_filters": constraints,
         "count": len(fallback),
         "items": fallback,
     }
