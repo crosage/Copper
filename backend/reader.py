@@ -298,6 +298,37 @@ def get_recent_llm_jobs(job_type: str, limit: int = 20) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def list_llm_jobs(status: str = "active", limit: int = 100) -> list[dict]:
+    conditions = []
+    params = []
+    if status == "active":
+        conditions.append("j.status IN ('running', 'queued', 'failed')")
+    elif status != "all":
+        conditions.append("j.status = ?")
+        params.append(status)
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    params.append(limit)
+    with get_db() as db:
+        rows = db.execute(f"""
+            SELECT j.paper_id, j.job_type, j.status, j.error, j.force,
+                   j.created_at, j.updated_at, j.started_at, j.finished_at,
+                   p.title, p.conference
+            FROM llm_jobs j
+            LEFT JOIN papers p ON p.id = j.paper_id
+            {where}
+            ORDER BY
+                CASE j.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,
+                CASE j.job_type WHEN 'translation' THEN 0 ELSE 1 END,
+                j.created_at ASC,
+                j.updated_at DESC
+            LIMIT ?
+        """, params).fetchall()
+    jobs = [dict(row) for row in rows]
+    for index, job in enumerate([j for j in jobs if j.get("status") == "queued"], 1):
+        job["queue_position"] = index
+    return jobs
+
+
 # ─────────────────────────────────────────────
 # CVF 爬取 (带缓存)
 # ─────────────────────────────────────────────
@@ -1313,6 +1344,40 @@ def delete_analysis(paper_id: str) -> dict:
     return {"paper_id": paper_id, "deleted": True, "status": "missing"}
 
 
+def delete_translation(paper_id: str) -> dict:
+    with TRANSLATION_LOCK:
+        future = TRANSLATION_JOBS.get(paper_id)
+        if future and not future.done():
+            future.cancel()
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+            raise HTTPException(404, "paper not found")
+        db.execute("""
+            UPDATE analyses
+            SET translation='', translation_model='', translation_token_count=0, translation_created_at=NULL
+            WHERE paper_id=?
+        """, (paper_id,))
+        db.execute("DELETE FROM translation_chunks WHERE paper_id=?", (paper_id,))
+    set_llm_job(paper_id, "translation", "missing")
+    return {"paper_id": paper_id, "deleted": True, "status": "missing"}
+
+
+def delete_llm_job(paper_id: str, job_type: str) -> dict:
+    if job_type == "analysis":
+        return delete_analysis(paper_id)
+    if job_type == "translation":
+        return delete_translation(paper_id)
+    raise HTTPException(400, "unsupported job_type")
+
+
+def retry_llm_job(paper_id: str, job_type: str) -> dict:
+    if job_type == "analysis":
+        return queue_analysis(paper_id, force=True)
+    if job_type == "translation":
+        return queue_translation(paper_id, force=True)
+    raise HTTPException(400, "unsupported job_type")
+
+
 
 def translate_paper(paper_id: str) -> str:
     """Call the LLM to generate a Chinese translation for the paper."""
@@ -1915,6 +1980,12 @@ def get_translation_status(paper_id: str):
     return {"paper_id": paper_id, "status": status, "cached": False, "job": dict(job) if job else None}
 
 
+@app.delete("/api/papers/{paper_id}/translate")
+def delete_paper_translation(paper_id: str):
+    """Delete cached translation/chunks so it can be regenerated."""
+    return delete_translation(paper_id)
+
+
 @app.get("/api/papers/{paper_id}/translate/chunks")
 def get_translation_chunks(paper_id: str):
     """Get per-chunk translation progress for retry/debug UI."""
@@ -1926,10 +1997,44 @@ def get_translation_chunks(paper_id: str):
             WHERE paper_id=?
             ORDER BY chunk_index
         """, (paper_id,)).fetchall()
+    chunks = [dict(row) for row in rows]
+    total = max([int(chunk.get("chunk_total") or 0) for chunk in chunks] or [0])
+    done = sum(1 for chunk in chunks if chunk.get("status") == "done")
+    running = next((chunk for chunk in chunks if chunk.get("status") == "running"), None)
+    failed = [chunk for chunk in chunks if chunk.get("status") == "failed"]
     return {
         "paper_id": paper_id,
-        "chunks": [dict(row) for row in rows],
+        "chunks": chunks,
+        "total": total,
+        "done": done,
+        "running": running,
+        "failed": failed,
     }
+
+
+@app.get("/api/llm-jobs")
+def get_llm_jobs(status: str = "active", limit: int = 100):
+    """Unified analysis/translation task list for task-center UI."""
+    limit = max(1, min(limit, 200))
+    status = status if status in {"active", "all", "queued", "running", "failed", "done", "cached", "missing"} else "active"
+    return {
+        "status": status,
+        "jobs": list_llm_jobs(status=status, limit=limit),
+        "analysis": analysis_queue_summary(),
+        "translation": translation_queue_summary(),
+    }
+
+
+@app.post("/api/llm-jobs/{job_type}/{paper_id}/retry")
+def retry_paper_llm_job(job_type: str, paper_id: str):
+    """Retry a failed/stale analysis or translation job."""
+    return retry_llm_job(paper_id, job_type)
+
+
+@app.delete("/api/llm-jobs/{job_type}/{paper_id}")
+def delete_paper_llm_job(job_type: str, paper_id: str):
+    """Delete a task and its cached output, if any."""
+    return delete_llm_job(paper_id, job_type)
 
 
 @app.get("/api/translations/status")
